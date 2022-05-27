@@ -3,7 +3,9 @@ package command
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -23,6 +25,37 @@ type ProvidersMirrorCommand struct {
 	Meta
 }
 
+func copyFile(srcPath string, destPath string) (err error) {
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return
+	}
+	log.Printf("[DEBUG] opened %s for read.", srcPath)
+
+	destFile, err := os.Create(destPath)
+	if err != nil {
+		srcFile.Close()
+		return
+	}
+	log.Printf("[DEBUG] opened %s for write.", destPath)
+
+	_, copyErr := io.Copy(destFile, srcFile)
+	log.Printf("[DEBUG] tried to copy: err=%s.", copyErr)
+
+	err = srcFile.Close()
+	if err != nil {
+		log.Printf("[WARN] closing source %s: %s.", srcPath, err)
+	}
+
+	err = destFile.Close()
+	if err != nil {
+		log.Printf("[WARN] closing destination %s: %s.", destPath, err)
+	}
+
+	err = copyErr
+	return
+}
+
 func (c *ProvidersMirrorCommand) Synopsis() string {
 	return "Save local copies of all required provider plugins"
 }
@@ -32,6 +65,8 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 	cmdFlags := c.Meta.defaultFlagSet("providers mirror")
 	var optPlatforms FlagStringSlice
 	cmdFlags.Var(&optPlatforms, "platform", "target platform")
+	var optKeep bool
+	cmdFlags.BoolVar(&optKeep, "keep", false, "keep (don't re-download) existing providers")
 	cmdFlags.Usage = func() { c.Ui.Error(c.Help()) }
 	if err := cmdFlags.Parse(args); err != nil {
 		c.Ui.Error(fmt.Sprintf("Error parsing command-line flags: %s\n", err.Error()))
@@ -108,10 +143,11 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 	// - It can mirror packages for potentially many different target platforms,
 	//   so that we can construct a multi-platform mirror regardless of which
 	//   platform we run this command on.
-	// - It ignores what's already present and just always downloads everything
-	//   that the configuration requires. This is a command intended to be run
-	//   infrequently to update a mirror, so it doesn't need to optimize away
-	//   fetches of packages that might already be present.
+	// - If optKeep is false (its default value), it will ignore what's already
+	// 	 present and just always download everything that the configuration
+	// 	 requires. This is a command intended to be run infrequently to update a
+	// 	 mirror, so it doesn't need to optimize away fetches of packages that
+	// 	 might already be present.
 
 	ctx, cancel := c.InterruptibleContext()
 	defer cancel()
@@ -186,16 +222,35 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 			// does not follow the filesystem mirror file naming convention.)
 			targetPath := meta.PackedFilePath(outputDir)
 			stagingPath := filepath.Join(filepath.Dir(targetPath), "."+filepath.Base(targetPath))
-			err = httpGetter.GetFile(stagingPath, urlObj)
-			if err != nil {
-				diags = diags.Append(tfdiags.Sourceless(
-					tfdiags.Error,
-					"Cannot download provider release",
-					fmt.Sprintf("Failed to download %s v%s for %s: %s.", provider.String(), selected.String(), platform.String(), err),
-				))
-				continue
+			downloadPackage := true
+			if optKeep {
+				// Check to see if we can re-use an existing package. If we can,
+				// we copy it to the staging location so we can re-authenticate
+				// it.
+				err = copyFile(targetPath, stagingPath)
+				if err == nil {
+					log.Printf("[DEBUG] copied %s to %s successfully.", targetPath, stagingPath)
+					downloadPackage = false
+				} else {
+					log.Printf("[WARN] failed to copy %s to %s: %s.", targetPath, stagingPath, err)
+				}
+			}
+			if downloadPackage {
+				// Retrieve the remote file into the staging location.
+				err = httpGetter.GetFile(stagingPath, urlObj)
+				if err != nil {
+					diags = diags.Append(tfdiags.Sourceless(
+						tfdiags.Error,
+						"Cannot download provider release",
+						fmt.Sprintf("Failed to download %s v%s for %s: %s.", provider.String(), selected.String(), platform.String(), err),
+					))
+					continue
+				}
+				log.Printf("[DEBUG] downloaded %s to %s.", urlObj, stagingPath)
 			}
 			if meta.Authentication != nil {
+				// Regardless of whether we downloaded a new one or not,
+				// authenticate it if we can.
 				result, err := meta.Authentication.AuthenticatePackage(getproviders.PackageLocalArchive(stagingPath))
 				if err != nil {
 					diags = diags.Append(tfdiags.Sourceless(
@@ -207,15 +262,26 @@ func (c *ProvidersMirrorCommand) Run(args []string) int {
 				}
 				c.Ui.Output(fmt.Sprintf("  - Package authenticated: %s", result))
 			}
-			os.Remove(targetPath) // okay if it fails because we're going to try to rename over it next anyway
-			err = os.Rename(stagingPath, targetPath)
-			if err != nil {
-				diags = diags.Append(tfdiags.Sourceless(
-					tfdiags.Error,
-					"Cannot download provider release",
-					fmt.Sprintf("Failed to place %s package into mirror directory: %s.", provider.String(), err),
-				))
-				continue
+			if downloadPackage {
+				// If we did download it (and successfully authenticated the new
+				// download), we want to save it to the final target
+				// (destination) path, overwrititng any previous content.
+				os.Remove(targetPath) // okay if it fails because we're going to try to rename over it next anyway
+				err = os.Rename(stagingPath, targetPath)
+				if err != nil {
+					diags = diags.Append(tfdiags.Sourceless(
+						tfdiags.Error,
+						"Cannot download provider release",
+						fmt.Sprintf("Failed to place %s package into mirror directory: %s.", provider.String(), err),
+					))
+					continue
+				}
+				log.Printf("[DEBUG] created new %s.", targetPath)
+			} else {
+				// But if we re-used the existing target file, let's delete the
+				// *staging* file -- so that we can probe the mtime of the
+				// package, to verify that we successfully re-used it.
+				os.Remove(stagingPath)
 			}
 		}
 	}
